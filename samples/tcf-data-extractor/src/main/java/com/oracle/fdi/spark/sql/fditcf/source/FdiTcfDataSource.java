@@ -73,6 +73,9 @@ public class FdiTcfDataSource implements TableProvider, DataSourceRegister {
 
     private Map<String, String> applyPathRestriction(Map<String, String> in) {
         Map<String, String> out = new HashMap<>(in);
+        // Date-effective delete files contain only the columns required for the delete. Merge the
+        // Parquet schemas so inserts, updates, and partial delete rows share one logical schema.
+        out.put("mergeSchema", "true");
         String base = out.get("path");
         if (base != null) {
             // Derive from marker files under basePath/markers as needed
