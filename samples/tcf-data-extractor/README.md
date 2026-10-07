@@ -95,6 +95,11 @@ marker-based range.
 
 The sink is responsible for applying inserts, updates, and deletes from each SCN to the destination system.
 
+For schemas that define `dateEffectiveCols`, explicit delete rows are matched using those columns.
+Insert and update rows continue to use `primaryKeyCols`. If `dateEffectiveCols` is absent or its
+complete key is unavailable, delete processing falls back to the primary key, preserving behavior
+for existing TCF datasets.
+
 Typical flow:
 
 ```java
@@ -677,6 +682,8 @@ Reference:
     1. `fdi_scn_id`
     2. `fdi_table_change_type`
     3. `fdi_change_type`
+- It merges the Parquet schemas across change folders because date-effective delete files may
+  contain only the columns required to identify rows for deletion.
 - `FdiTcfScanBuilder` handles SCN-based partition pruning and schema resolution during query planning.
 
 If no `startingScn` and `endingScn` are provided, the datasource automatically resolves the valid SCN range using marker files.
