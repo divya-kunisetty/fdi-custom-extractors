@@ -10,6 +10,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 import static com.oracle.fdi.datashare.tcf.sdk.api.ApiConstants.*;
 import static org.apache.spark.sql.functions.*;
@@ -24,6 +27,69 @@ public final class SinkUtils {
     private static final Random RANDOM = new Random();
 
     private SinkUtils() {}
+
+    /**
+     * Resolves the columns used for explicit delete rows. Date-effective columns take precedence
+     * when the complete configured key is available, followed by the primary key and then the
+     * available dataset columns from the published schema.
+     */
+    public static List<String> getDeleteColumns(DatasetSchema schema, String[] datasetColumns) {
+        List<String> dateEffectiveColumns = getCompleteConfiguredColumns(
+                schema.getDateEffectiveColumnList(), datasetColumns, schema);
+        if (!dateEffectiveColumns.isEmpty()) {
+            log.info("Using date-effective columns for deletes: {}", dateEffectiveColumns);
+            return dateEffectiveColumns;
+        }
+
+        List<String> primaryKeyColumns = getCompleteConfiguredColumns(
+                schema.getPrimaryKeyList(), datasetColumns, schema);
+        if (!primaryKeyColumns.isEmpty()) {
+            log.info("Using primary-key columns for deletes: {}", primaryKeyColumns);
+            return primaryKeyColumns;
+        }
+
+        Set<String> availableColumns = caseInsensitiveSet(List.of(datasetColumns));
+        List<String> schemaColumns = schema.getSchema() == null
+                ? List.of()
+                : schema.getSchema().stream()
+                        .map(DatasetSchema.Column::getColName)
+                        .filter(availableColumns::contains)
+                        .collect(Collectors.toList());
+        if (schemaColumns.isEmpty()) {
+            throw new IllegalArgumentException("No suitable columns are available for deletes");
+        }
+
+        log.info("Using all available dataset columns for deletes: {}", schemaColumns);
+        return schemaColumns;
+    }
+
+    private static List<String> getCompleteConfiguredColumns(
+            List<String> configuredColumns,
+            String[] datasetColumns,
+            DatasetSchema schema) {
+        if (configuredColumns.isEmpty() || schema.getSchema() == null) {
+            return List.of();
+        }
+
+        Set<String> availableColumns = caseInsensitiveSet(List.of(datasetColumns));
+        if (!configuredColumns.stream().allMatch(availableColumns::contains)) {
+            return List.of();
+        }
+
+        Set<String> configuredColumnSet = caseInsensitiveSet(configuredColumns);
+        List<String> matchingColumns = schema.getSchema().stream()
+                .map(DatasetSchema.Column::getColName)
+                .filter(configuredColumnSet::contains)
+                .collect(Collectors.toList());
+
+        return matchingColumns.size() == configuredColumns.size() ? matchingColumns : List.of();
+    }
+
+    private static Set<String> caseInsensitiveSet(List<String> columns) {
+        Set<String> result = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        result.addAll(columns);
+        return result;
+    }
 
     /**
      * Deduplicate incoming change rows by primary key with preference order:

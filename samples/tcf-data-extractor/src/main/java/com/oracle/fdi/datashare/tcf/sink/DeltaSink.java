@@ -1,9 +1,10 @@
 package com.oracle.fdi.datashare.tcf.sink;
 
-import java.util.stream.Collectors;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import org.apache.hadoop.fs.Path;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -29,7 +30,6 @@ public class DeltaSink implements Sink {
 
     private static final String SOURCE_ALIAS = "source";
     private static final String TARGET_ALIAS = "target";
-    private static final String SOURCE_FDI_CHANGE_TYPE = SOURCE_ALIAS + "." + FDI_CHANGE_TYPE;
 
     // Underlying sink configuration from manifest
     private final PipelineManifest.SinkConfig sinkConfig;
@@ -69,9 +69,9 @@ public class DeltaSink implements Sink {
     }
 
     @Override
-    public WriteSummary applyChangeSets(String datasetName, Dataset changesets, DatasetSchema schema) {
+    public WriteSummary applyChangeSets(String datasetName, Dataset<Row> changesets, DatasetSchema schema) {
         // Target Delta table location for this dataset
-         Path deltaTablePath = new Path(deltaBasePath, datasetName);
+        Path deltaTablePath = new Path(deltaBasePath, datasetName);
 
         boolean isFullRefresh = false;
         List<Row> rows = changesets.limit(1).collectAsList();
@@ -102,40 +102,58 @@ public class DeltaSink implements Sink {
             }
         }
 
-        // Open the target Delta table and build the primary-key merge predicate.
+        // Apply explicit deletes separately because date-effective delete rows may not contain the
+        // primary key or the full table schema.
         DeltaTable targetDeltaTable = DeltaTable.forPath(changesets.sparkSession(), deltaTablePath.toString());
-        String mergeCondition = buildMergeCondition(schema);
-
-        // For efficiency: only dedupe for non-full refresh batches.
-        Dataset<Row> sourceForMerge;
-        if (isFullRefresh) {
-            sourceForMerge = changesets;
-        } else {
-            sourceForMerge = SinkUtils.dedupeChangesets(changesets, schema);
+        Dataset<Row> deletes = changesets
+                .filter(lower(col(FDI_CHANGE_TYPE)).equalTo(lit(FDI_CHANGE_TYPE_DELETE)));
+        if (!deletes.isEmpty()) {
+            List<String> deleteColumns = SinkUtils.getDeleteColumns(schema, deletes.columns());
+            String deleteCondition = buildMergeCondition(deleteColumns);
+            Column[] deleteColumnExpressions = deleteColumns.stream()
+                    .map(column -> col(column))
+                    .toArray(Column[]::new);
+            log.info("Deleting rows from {} using columns {}", datasetName, deleteColumns);
+            targetDeltaTable.as(TARGET_ALIAS)
+                    .merge(deletes.select(deleteColumnExpressions).as(SOURCE_ALIAS), deleteCondition)
+                    .whenMatched()
+                    .delete()
+                    .execute();
         }
 
-        targetDeltaTable.as(TARGET_ALIAS)
-                .merge(sourceForMerge.as(SOURCE_ALIAS), mergeCondition)
-                .whenMatched(col(SOURCE_FDI_CHANGE_TYPE).equalTo(lit(FDI_CHANGE_TYPE_DELETE))).delete()
-                .whenMatched().updateAll()
-                .whenNotMatched(col(SOURCE_FDI_CHANGE_TYPE).notEqual(lit(FDI_CHANGE_TYPE_DELETE))).insertAll()
-                .execute();
+        Dataset<Row> upserts = changesets
+                .filter(lower(col(FDI_CHANGE_TYPE)).notEqual(lit(FDI_CHANGE_TYPE_DELETE)));
+        if (!upserts.isEmpty()) {
+            String mergeCondition = buildMergeCondition(schema.getPrimaryKeyList());
+
+            // For efficiency: only dedupe for non-full refresh batches.
+            Dataset<Row> sourceForMerge = isFullRefresh
+                    ? upserts
+                    : SinkUtils.dedupeChangesets(upserts, schema);
+
+            targetDeltaTable.as(TARGET_ALIAS)
+                    .merge(sourceForMerge.as(SOURCE_ALIAS), mergeCondition)
+                    .whenMatched()
+                    .updateAll()
+                    .whenNotMatched()
+                    .insertAll()
+                    .execute();
+        }
 
         WriteSummary summary = new WriteSummary();
         summary.setStatus("SUCCESS");
         return summary;
     }
 
-    private String buildMergeCondition(DatasetSchema schema) {
-        List<String> pkCols = schema.getPrimaryKeyList();
-        if (pkCols == null || pkCols.isEmpty()) {
-            throw new IllegalArgumentException("Primary key columns are empty; cannot build merge condition");
+    private String buildMergeCondition(List<String> columns) {
+        if (columns == null || columns.isEmpty()) {
+            throw new IllegalArgumentException("Merge columns are empty; cannot build merge condition");
         }
 
-        return pkCols.stream()
+        return columns.stream()
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
-                .map(pk -> SOURCE_ALIAS + ".`" + pk + "` = " + TARGET_ALIAS + ".`" + pk + "`")
+                .map(column -> SOURCE_ALIAS + ".`" + column + "` = " + TARGET_ALIAS + ".`" + column + "`")
                 .collect(Collectors.joining(" and "));
     }
 
