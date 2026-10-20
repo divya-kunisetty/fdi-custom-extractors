@@ -39,6 +39,76 @@ public class SinkUtilsTest {
         assertThrows(IllegalArgumentException.class,
                 () -> SinkUtils.getDeleteColumns(schema, new String[] {"unknown"}));
     }
+    @Test
+    public void resolvesPrefixedDateEffectiveColumnsToPublishedNames() {
+        DatasetSchema schema = prefixedSchema("CX_ID", "CX_END_DATE, CX_START_DATE");
+
+        List<String> result = SinkUtils.getDeleteColumns(
+                schema, new String[] {"id", "end_date", "start_date"});
+
+        assertEquals(List.of("start_date", "end_date"), result);
+    }
+
+    @Test
+    public void resolvesPrefixedPrimaryKeyToPublishedName() {
+        DatasetSchema schema = prefixedSchema("CX_ID", null);
+
+        List<String> result = SinkUtils.getDeleteColumns(schema, new String[] {"name", "id"});
+
+        assertEquals(List.of("id"), result);
+    }
+
+    @Test
+    public void resolvesPrefixedSchemaColumnsForDeleteFallback() {
+        DatasetSchema schema = prefixedSchema("CX_ID, CX_NAME", "CX_START_DATE, CX_END_DATE");
+
+        List<String> result = SinkUtils.getDeleteColumns(
+                schema, new String[] {"name", "end_date", "unknown"});
+
+        assertEquals(List.of("end_date", "name"), result);
+    }
+
+    @Test
+    public void fallsBackToPrimaryKeyWhenPrefixedDateEffectiveKeyIsIncomplete() {
+        DatasetSchema schema = prefixedSchema("CX_ID", "CX_START_DATE, CX_END_DATE");
+
+        List<String> result = SinkUtils.getDeleteColumns(schema, new String[] {"id", "start_date"});
+
+        assertEquals(List.of("id"), result);
+    }
+
+    @Test
+    public void preservesLiteralPrefixWhenBothColumnNamesExist() {
+        DatasetSchema schema = prefixedSchema("CX_ID", null);
+
+        List<String> result = SinkUtils.getDeleteColumns(schema, new String[] {"id", "CX_ID"});
+
+        assertEquals(List.of("CX_ID"), result);
+    }
+
+    @Test
+    public void doesNotStripAnEmbeddedPrefix() {
+        DatasetSchema schema = schema("ACCOUNT_CX_ID", null);
+        schema.setSchema(List.of(column("ACCOUNT_CX_ID")));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> SinkUtils.getDeleteColumns(schema, new String[] {"id"}));
+    }
+
+    @Test
+    public void doesNotAddPrefixToMissingColumns() {
+        DatasetSchema schema = schema("ID", null);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> SinkUtils.getDeleteColumns(schema, new String[] {"CX_ID"}));
+    }
+
+    private DatasetSchema prefixedSchema(String primaryKeyCols, String dateEffectiveCols) {
+        DatasetSchema schema = schema(primaryKeyCols, dateEffectiveCols);
+        schema.getSchema().forEach(column -> column.setColName("CX_" + column.getColName()));
+        return schema;
+    }
+
     private DatasetSchema schema(String primaryKeyCols, String dateEffectiveCols) {
         DatasetSchema schema = new DatasetSchema();
         schema.setPrimaryKeyCols(primaryKeyCols);

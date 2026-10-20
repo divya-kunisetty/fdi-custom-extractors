@@ -73,33 +73,43 @@ public class DeltaSink implements Sink {
         // Target Delta table location for this dataset
         Path deltaTablePath = new Path(deltaBasePath, datasetName);
 
-        boolean isFullRefresh = false;
         List<Row> rows = changesets.limit(1).collectAsList();
+        if (rows.isEmpty() && schema.getFullRefresh() == null) {
+            throw new IllegalArgumentException("fullRefresh metadata is required for an empty publish: " + datasetName);
+        }
+        boolean isFullRefresh = Boolean.TRUE.equals(schema.getFullRefresh());
         if (!rows.isEmpty()) {
-            if (FDI_CHANGE_TYPE_FULL_REFRESH.equalsIgnoreCase(rows.get(0).getAs(FDI_TABLE_CHANGE_TYPE))) {
-                isFullRefresh = true;
+            isFullRefresh = FDI_CHANGE_TYPE_FULL_REFRESH.equalsIgnoreCase(rows.get(0).getAs(FDI_TABLE_CHANGE_TYPE));
+        }
+
+        SparkSession spark = changesets.sparkSession();
+        String path = deltaTablePath.toString();
+        boolean targetExists = DeltaTable.isDeltaTable(spark, path);
+
+        if (isFullRefresh) {
+            log.info("Bootstrapping full refresh for {} at {}", datasetName, deltaTablePath);
+            if (targetExists) {
+                // remove existing rows without writing an empty parquet file
+                DeltaTable.forPath(spark, path).delete(expr("true"));
             }
         }
 
-        // Bootstrap the Delta table if it does not exist
-        if (isFullRefresh) {
-            log.info("Bootstrapping full refresh for {} at {}", datasetName, deltaTablePath);
-
-            SparkSession spark = changesets.sparkSession();
-            String path = deltaTablePath.toString();
-
+        // A metadata-only first full refresh has no physical schema. Defer creating its target
+        // until Parquet provides actual types and column names, even if that file has zero rows.
+        if (!targetExists) {
             Dataset<Row> bootstrapDf = changesets.drop(FDI_TABLE_CHANGE_TYPE, FDI_CHANGE_TYPE, FDI_SCN_ID);
-
-            if (DeltaTable.isDeltaTable(spark, path)) {
-                // remove existing rows without writing an empty parquet file
-                DeltaTable.forPath(spark, path).delete(expr("true"));
-            } else {
-                // create metadata-only delta table using the incoming DataFrame schema
+            if (bootstrapDf.columns().length > 0) {
                 DeltaTable.createIfNotExists(spark)
                         .location(path)
                         .addColumns(bootstrapDf.schema())
                         .execute();
             }
+        }
+
+        if (rows.isEmpty()) {
+            WriteSummary summary = new WriteSummary();
+            summary.setStatus("SUCCESS");
+            return summary;
         }
 
         // Apply explicit deletes separately because date-effective delete rows may not contain the
@@ -124,7 +134,8 @@ public class DeltaSink implements Sink {
         Dataset<Row> upserts = changesets
                 .filter(lower(col(FDI_CHANGE_TYPE)).notEqual(lit(FDI_CHANGE_TYPE_DELETE)));
         if (!upserts.isEmpty()) {
-            String mergeCondition = buildMergeCondition(schema.getPrimaryKeyList());
+            String mergeCondition = buildMergeCondition(
+                    SinkUtils.resolveColumnNames(schema.getPrimaryKeyList(), upserts.columns()));
 
             // For efficiency: only dedupe for non-full refresh batches.
             Dataset<Row> sourceForMerge = isFullRefresh

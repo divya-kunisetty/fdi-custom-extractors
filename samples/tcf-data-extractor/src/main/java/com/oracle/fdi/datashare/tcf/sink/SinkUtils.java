@@ -9,8 +9,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
@@ -27,6 +29,24 @@ public final class SinkUtils {
     private static final Random RANDOM = new Random();
 
     private SinkUtils() {}
+
+    /**
+     * Prefer an existing metadata name. Resolve a missing CX_ name only when its unprefixed
+     * column exists in the published data; never rename the data or add a missing prefix.
+     */
+    public static List<String> resolveColumnNames(List<String> columnNames, String[] datasetColumns) {
+        Map<String, String> availableColumns = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String column : datasetColumns) {
+            availableColumns.put(column, column);
+        }
+
+        return columnNames.stream()
+                .map(column -> !availableColumns.containsKey(column)
+                        && column.regionMatches(true, 0, "CX_", 0, 3)
+                        ? availableColumns.getOrDefault(column.substring(3), column)
+                        : column)
+                .collect(Collectors.toList());
+    }
 
     /**
      * Resolves the columns used for explicit delete rows. Date-effective columns take precedence
@@ -49,12 +69,9 @@ public final class SinkUtils {
         }
 
         Set<String> availableColumns = caseInsensitiveSet(List.of(datasetColumns));
-        List<String> schemaColumns = schema.getSchema() == null
-                ? List.of()
-                : schema.getSchema().stream()
-                        .map(DatasetSchema.Column::getColName)
-                        .filter(availableColumns::contains)
-                        .collect(Collectors.toList());
+        List<String> schemaColumns = getSchemaColumnNames(schema, datasetColumns).stream()
+                .filter(availableColumns::contains)
+                .collect(Collectors.toList());
         if (schemaColumns.isEmpty()) {
             throw new IllegalArgumentException("No suitable columns are available for deletes");
         }
@@ -71,18 +88,26 @@ public final class SinkUtils {
             return List.of();
         }
 
+        List<String> resolvedColumns = resolveColumnNames(configuredColumns, datasetColumns);
         Set<String> availableColumns = caseInsensitiveSet(List.of(datasetColumns));
-        if (!configuredColumns.stream().allMatch(availableColumns::contains)) {
+        if (!resolvedColumns.stream().allMatch(availableColumns::contains)) {
             return List.of();
         }
 
-        Set<String> configuredColumnSet = caseInsensitiveSet(configuredColumns);
-        List<String> matchingColumns = schema.getSchema().stream()
-                .map(DatasetSchema.Column::getColName)
+        Set<String> configuredColumnSet = caseInsensitiveSet(resolvedColumns);
+        List<String> matchingColumns = getSchemaColumnNames(schema, datasetColumns).stream()
                 .filter(configuredColumnSet::contains)
                 .collect(Collectors.toList());
 
         return matchingColumns.size() == configuredColumns.size() ? matchingColumns : List.of();
+    }
+
+    private static List<String> getSchemaColumnNames(DatasetSchema schema, String[] datasetColumns) {
+        return schema.getSchema() == null
+                ? List.of()
+                : resolveColumnNames(schema.getSchema().stream()
+                        .map(DatasetSchema.Column::getColName)
+                        .collect(Collectors.toList()), datasetColumns);
     }
 
     private static Set<String> caseInsensitiveSet(List<String> columns) {
@@ -97,7 +122,7 @@ public final class SinkUtils {
      * so SCN is not used as a tie-breaker.
      */
     public static Dataset<Row> dedupeChangesets(Dataset<Row> changesets, DatasetSchema schema) {
-        List<String> pkCols = schema.getPrimaryKeyList();
+        List<String> pkCols = resolveColumnNames(schema.getPrimaryKeyList(), changesets.columns());
         if (pkCols == null || pkCols.isEmpty()) {
             //Log an error message and return the original dataset
             log.error("Primary key columns are empty; cannot dedupe changesets");
